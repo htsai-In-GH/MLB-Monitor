@@ -1,439 +1,436 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "f006e489-ea24-4034-9964-d6e29f1878dd",
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "=== MLB Live Monitor | 2026-04-10 14:49:15 ===\n",
-      "只顯示正在進行中的比賽 | 第八局推播：ON\n",
-      "============================================================================================================================================\n",
-      "Pittsburgh Pirates 0 : 0 Chicago Cubs\n",
-      "Top 3 | 0B1S 0Outs Bases ○ ○ ○\n",
-      "P: Shota Imanaga ERA 3.75 | 36 Pitches\n",
-      "B: Joey Bart AVG .167 | Next1 Billy Cook AVG .000 | Next2 Nick Yorke AVG .364\n",
-      "--------------------------------------------------------------------------------------------------------------------------------------------\n"
-     ]
-    }
-   ],
-   "source": [
-    "import time\n",
-    "import requests\n",
-    "from datetime import datetime\n",
-    "from IPython.display import clear_output\n",
-    "\n",
-    "SCHEDULE_URL = \"https://statsapi.mlb.com/api/v1/schedule\"\n",
-    "LIVE_URL = \"https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live\"\n",
-    "\n",
-    "ACTIVE_STATUSES = {\n",
-    "    \"In Progress\",\n",
-    "    \"Manager Challenge\",\n",
-    "    \"Review\",\n",
-    "}\n",
-    "\n",
-    "class MLBLiveMonitor:\n",
-    "    def __init__(\n",
-    "        self,\n",
-    "        refresh_seconds: int = 10,\n",
-    "        push_enabled: bool = True,\n",
-    "        push_url: str = \"https://ntfy.sh/notiMLB26\",\n",
-    "    ):\n",
-    "        self.session = requests.Session()\n",
-    "        self.refresh_seconds = refresh_seconds\n",
-    "        self.push_enabled = push_enabled\n",
-    "        self.push_url = push_url.strip()\n",
-    "        self.eighth_inning_alerted = {}\n",
-    "        self.running = False\n",
-    "\n",
-    "    def safe_get(self, d, *keys, default=\"\"):\n",
-    "        cur = d\n",
-    "        for k in keys:\n",
-    "            if not isinstance(cur, dict):\n",
-    "                return default\n",
-    "            cur = cur.get(k)\n",
-    "            if cur is None:\n",
-    "                return default\n",
-    "        return cur\n",
-    "\n",
-    "    def send_ntfy(self, title: str, message: str, priority: str = \"high\", tags=None):\n",
-    "        if not self.push_enabled or not self.push_url:\n",
-    "            return\n",
-    "\n",
-    "        headers = {\n",
-    "            \"Title\": title,  # 請保持 ASCII，避免 header 編碼錯誤\n",
-    "            \"Priority\": priority,\n",
-    "            \"Content-Type\": \"text/plain; charset=utf-8\",\n",
-    "        }\n",
-    "        if tags:\n",
-    "            headers[\"Tags\"] = \",\".join(tags)\n",
-    "\n",
-    "        r = requests.post(\n",
-    "            self.push_url,\n",
-    "            data=message.encode(\"utf-8\"),\n",
-    "            headers=headers,\n",
-    "            timeout=10\n",
-    "        )\n",
-    "        r.raise_for_status()\n",
-    "\n",
-    "    def get_today_games(self, date_str=None):\n",
-    "        if date_str is None:\n",
-    "            date_str = datetime.now().strftime(\"%Y-%m-%d\")\n",
-    "\n",
-    "        params = {\n",
-    "            \"sportId\": 1,\n",
-    "            \"date\": date_str\n",
-    "        }\n",
-    "\n",
-    "        r = self.session.get(SCHEDULE_URL, params=params, timeout=15)\n",
-    "        r.raise_for_status()\n",
-    "        data = r.json()\n",
-    "\n",
-    "        games = []\n",
-    "        for d in data.get(\"dates\", []):\n",
-    "            for g in d.get(\"games\", []):\n",
-    "                games.append({\n",
-    "                    \"gamePk\": g[\"gamePk\"],\n",
-    "                    \"away\": self.safe_get(g, \"teams\", \"away\", \"team\", \"name\", default=\"Away\"),\n",
-    "                    \"home\": self.safe_get(g, \"teams\", \"home\", \"team\", \"name\", default=\"Home\"),\n",
-    "                    \"status\": self.safe_get(g, \"status\", \"detailedState\", default=\"\"),\n",
-    "                })\n",
-    "        return games\n",
-    "\n",
-    "    def format_bases_compact(self, on_1b, on_2b, on_3b):\n",
-    "        # 顯示順序：3B, 2B, 1B\n",
-    "        return f\"{'●' if on_3b else '○'} {'●' if on_2b else '○'} {'●' if on_1b else '○'}\"\n",
-    "\n",
-    "    def format_bases_text(self, on_1b, on_2b, on_3b):\n",
-    "        occupied = []\n",
-    "        if on_3b:\n",
-    "            occupied.append(\"3B\")\n",
-    "        if on_2b:\n",
-    "            occupied.append(\"2B\")\n",
-    "        if on_1b:\n",
-    "            occupied.append(\"1B\")\n",
-    "\n",
-    "        if len(occupied) == 3:\n",
-    "            return \"滿壘\"\n",
-    "        if not occupied:\n",
-    "            return \"無人\"\n",
-    "        return \" \".join(occupied)\n",
-    "\n",
-    "    def get_player_stat_avg(self, player_obj):\n",
-    "        avg = self.safe_get(player_obj, \"seasonStats\", \"batting\", \"avg\", default=\"\")\n",
-    "        if avg != \"\":\n",
-    "            return avg\n",
-    "\n",
-    "        stat = self.safe_get(player_obj, \"stats\", \"batting\", \"avg\", default=\"\")\n",
-    "        if stat != \"\":\n",
-    "            return stat\n",
-    "\n",
-    "        summary = self.safe_get(player_obj, \"stats\", \"batting\", \"summary\", default=\"\")\n",
-    "        return summary\n",
-    "\n",
-    "    def get_player_stat_era(self, player_obj):\n",
-    "        era = self.safe_get(player_obj, \"seasonStats\", \"pitching\", \"era\", default=\"\")\n",
-    "        if era != \"\":\n",
-    "            return era\n",
-    "\n",
-    "        stat = self.safe_get(player_obj, \"stats\", \"pitching\", \"era\", default=\"\")\n",
-    "        if stat != \"\":\n",
-    "            return stat\n",
-    "\n",
-    "        summary = self.safe_get(player_obj, \"stats\", \"pitching\", \"summary\", default=\"\")\n",
-    "        return summary\n",
-    "\n",
-    "    def get_pitch_count(self, player_obj):\n",
-    "        candidates = [\n",
-    "            self.safe_get(player_obj, \"stats\", \"pitching\", \"numberOfPitches\", default=\"\"),\n",
-    "            self.safe_get(player_obj, \"stats\", \"pitching\", \"pitchesThrown\", default=\"\"),\n",
-    "            self.safe_get(player_obj, \"seasonStats\", \"pitching\", \"numberOfPitches\", default=\"\"),\n",
-    "        ]\n",
-    "        for c in candidates:\n",
-    "            if c != \"\":\n",
-    "                return c\n",
-    "        return \"\"\n",
-    "\n",
-    "    def get_live_snapshot(self, gamePk):\n",
-    "        url = LIVE_URL.format(gamePk=gamePk)\n",
-    "        r = self.session.get(url, timeout=15)\n",
-    "        r.raise_for_status()\n",
-    "        data = r.json()\n",
-    "\n",
-    "        game_data = data.get(\"gameData\", {})\n",
-    "        live_data = data.get(\"liveData\", {})\n",
-    "        linescore = live_data.get(\"linescore\", {})\n",
-    "        plays = live_data.get(\"plays\", {})\n",
-    "        boxscore = live_data.get(\"boxscore\", {})\n",
-    "\n",
-    "        away_name = self.safe_get(game_data, \"teams\", \"away\", \"name\", default=\"Away\")\n",
-    "        home_name = self.safe_get(game_data, \"teams\", \"home\", \"name\", default=\"Home\")\n",
-    "        status = self.safe_get(game_data, \"status\", \"detailedState\", default=\"\")\n",
-    "\n",
-    "        away_score = self.safe_get(linescore, \"teams\", \"away\", \"runs\", default=0)\n",
-    "        home_score = self.safe_get(linescore, \"teams\", \"home\", \"runs\", default=0)\n",
-    "\n",
-    "        inning = linescore.get(\"currentInning\", \"\")\n",
-    "        inning_state = linescore.get(\"inningState\", \"\")\n",
-    "        outs = linescore.get(\"outs\", 0)\n",
-    "\n",
-    "        offense = linescore.get(\"offense\", {})\n",
-    "        on_1b = \"first\" in offense\n",
-    "        on_2b = \"second\" in offense\n",
-    "        on_3b = \"third\" in offense\n",
-    "\n",
-    "        current_play = plays.get(\"currentPlay\", {})\n",
-    "        batter_id = self.safe_get(current_play, \"matchup\", \"batter\", \"id\", default=None)\n",
-    "        pitcher_id = self.safe_get(current_play, \"matchup\", \"pitcher\", \"id\", default=None)\n",
-    "\n",
-    "        batter_name = self.safe_get(current_play, \"matchup\", \"batter\", \"fullName\", default=\"\")\n",
-    "        pitcher_name = self.safe_get(current_play, \"matchup\", \"pitcher\", \"fullName\", default=\"\")\n",
-    "\n",
-    "        balls = self.safe_get(current_play, \"count\", \"balls\", default=\"?\")\n",
-    "        strikes = self.safe_get(current_play, \"count\", \"strikes\", default=\"?\")\n",
-    "\n",
-    "        all_players = {}\n",
-    "        all_players.update(self.safe_get(boxscore, \"teams\", \"away\", \"players\", default={}) or {})\n",
-    "        all_players.update(self.safe_get(boxscore, \"teams\", \"home\", \"players\", default={}) or {})\n",
-    "\n",
-    "        batter_avg = \"\"\n",
-    "        pitcher_era = \"\"\n",
-    "        pitcher_pitch_count = \"\"\n",
-    "\n",
-    "        if batter_id is not None:\n",
-    "            batter_obj = all_players.get(f\"ID{batter_id}\", {})\n",
-    "            batter_avg = self.get_player_stat_avg(batter_obj)\n",
-    "\n",
-    "        if pitcher_id is not None:\n",
-    "            pitcher_obj = all_players.get(f\"ID{pitcher_id}\", {})\n",
-    "            pitcher_era = self.get_player_stat_era(pitcher_obj)\n",
-    "            pitcher_pitch_count = self.get_pitch_count(pitcher_obj)\n",
-    "\n",
-    "        offense_team_key = \"\"\n",
-    "        if inning_state == \"Top\":\n",
-    "            offense_team_key = \"away\"\n",
-    "        elif inning_state == \"Bottom\":\n",
-    "            offense_team_key = \"home\"\n",
-    "\n",
-    "        next_batters = []\n",
-    "\n",
-    "        if offense_team_key:\n",
-    "            offense_team = self.safe_get(boxscore, \"teams\", offense_team_key, default={}) or {}\n",
-    "            batting_order = offense_team.get(\"battingOrder\", []) or []\n",
-    "            team_players = offense_team.get(\"players\", {}) or {}\n",
-    "\n",
-    "            current_index = None\n",
-    "            if batter_id is not None:\n",
-    "                batter_order_id = str(batter_id)\n",
-    "                for idx, pid in enumerate(batting_order):\n",
-    "                    if str(pid) == batter_order_id:\n",
-    "                        current_index = idx\n",
-    "                        break\n",
-    "\n",
-    "            if current_index is not None and len(batting_order) > 0:\n",
-    "                for step in [1, 2]:\n",
-    "                    next_idx = (current_index + step) % len(batting_order)\n",
-    "                    next_pid = batting_order[next_idx]\n",
-    "                    next_player_obj = team_players.get(f\"ID{next_pid}\", {})\n",
-    "                    next_name = self.safe_get(next_player_obj, \"person\", \"fullName\", default=\"\")\n",
-    "                    next_avg = self.get_player_stat_avg(next_player_obj)\n",
-    "                    if next_name:\n",
-    "                        next_batters.append({\n",
-    "                            \"name\": next_name,\n",
-    "                            \"avg\": next_avg\n",
-    "                        })\n",
-    "\n",
-    "        return {\n",
-    "            \"gamePk\": gamePk,\n",
-    "            \"away\": away_name,\n",
-    "            \"home\": home_name,\n",
-    "            \"away_score\": away_score,\n",
-    "            \"home_score\": home_score,\n",
-    "            \"status\": status,\n",
-    "            \"inning_state\": inning_state,\n",
-    "            \"inning\": inning,\n",
-    "            \"outs\": outs,\n",
-    "            \"balls\": balls,\n",
-    "            \"strikes\": strikes,\n",
-    "            \"on_1b\": on_1b,\n",
-    "            \"on_2b\": on_2b,\n",
-    "            \"on_3b\": on_3b,\n",
-    "            \"batter_name\": batter_name,\n",
-    "            \"batter_avg\": batter_avg,\n",
-    "            \"pitcher_name\": pitcher_name,\n",
-    "            \"pitcher_era\": pitcher_era,\n",
-    "            \"pitcher_pitch_count\": pitcher_pitch_count,\n",
-    "            \"next_batters\": next_batters,\n",
-    "        }\n",
-    "\n",
-    "    def check_eighth_inning_alert(self, s):\n",
-    "        if not self.push_enabled or not self.push_url:\n",
-    "            return\n",
-    "\n",
-    "        if s[\"status\"] not in ACTIVE_STATUSES:\n",
-    "            return\n",
-    "\n",
-    "        if s[\"inning\"] != 8:\n",
-    "            return\n",
-    "\n",
-    "        if s[\"inning_state\"] not in {\"Top\", \"Bottom\"}:\n",
-    "            return\n",
-    "\n",
-    "        key = f\"{s['gamePk']}_8\"\n",
-    "        if self.eighth_inning_alerted.get(key):\n",
-    "            return\n",
-    "\n",
-    "        bases_text = self.format_bases_text(s[\"on_1b\"], s[\"on_2b\"], s[\"on_3b\"])\n",
-    "        pitch_count_text = s[\"pitcher_pitch_count\"] if s[\"pitcher_pitch_count\"] != \"\" else \"?\"\n",
-    "        next1 = s[\"next_batters\"][0] if len(s[\"next_batters\"]) >= 1 else {\"name\": \"?\", \"avg\": \"?\"}\n",
-    "        next2 = s[\"next_batters\"][1] if len(s[\"next_batters\"]) >= 2 else {\"name\": \"?\", \"avg\": \"?\"}\n",
-    "\n",
-    "        title = f\"MLB 8th Inning Alert | {s['away']} @ {s['home']}\"\n",
-    "        message = (\n",
-    "            f\"{s['away']} {s['away_score']} : {s['home_score']} {s['home']}\\n\"\n",
-    "            f\"{s['inning_state']} {s['inning']} | {s['balls']}B{s['strikes']}S | {s['outs']}Outs | 壘包 {bases_text}\\n\"\n",
-    "            f\"P: {s['pitcher_name']} ERA {s['pitcher_era']} | {pitch_count_text} Pitches\\n\"\n",
-    "            f\"B: {s['batter_name']} AVG {s['batter_avg']} | \"\n",
-    "            f\"Next1 {next1['name']} AVG {next1['avg']} | \"\n",
-    "            f\"Next2 {next2['name']} AVG {next2['avg']}\"\n",
-    "        )\n",
-    "\n",
-    "        try:\n",
-    "            self.send_ntfy(\n",
-    "                title=title,\n",
-    "                message=message,\n",
-    "                priority=\"high\",\n",
-    "                tags=[\"baseball\", \"bell\"]\n",
-    "            )\n",
-    "            self.eighth_inning_alerted[key] = True\n",
-    "            print(f\"[PUSH] 已送出：{title}\")\n",
-    "        except Exception as e:\n",
-    "            print(f\"[PUSH] 失敗：{e}\")\n",
-    "\n",
-    "    def print_snapshot_four_lines(self, s):\n",
-    "        bases_compact = self.format_bases_compact(s[\"on_1b\"], s[\"on_2b\"], s[\"on_3b\"])\n",
-    "        pitch_count_text = s[\"pitcher_pitch_count\"] if s[\"pitcher_pitch_count\"] != \"\" else \"?\"\n",
-    "        balls_text = s[\"balls\"] if s[\"balls\"] != \"\" else \"?\"\n",
-    "        strikes_text = s[\"strikes\"] if s[\"strikes\"] != \"\" else \"?\"\n",
-    "\n",
-    "        line1 = f\"{s['away']} {s['away_score']} : {s['home_score']} {s['home']}\"\n",
-    "        line2 = f\"{s['inning_state']} {s['inning']} | {balls_text}B {strikes_text}s {s['outs']}outs Bases {bases_compact}\"\n",
-    "        line3 = f\"P: {s['pitcher_name']} ERA {s['pitcher_era']} | {pitch_count_text} Pitches\"\n",
-    "\n",
-    "        next1 = s[\"next_batters\"][0] if len(s[\"next_batters\"]) >= 1 else {\"name\": \"?\", \"avg\": \"?\"}\n",
-    "        next2 = s[\"next_batters\"][1] if len(s[\"next_batters\"]) >= 2 else {\"name\": \"?\", \"avg\": \"?\"}\n",
-    "        line4 = (\n",
-    "            f\"B: {s['batter_name']} AVG {s['batter_avg']} | \"\n",
-    "            f\"Next1 {next1['name']} AVG {next1['avg']} | \"\n",
-    "            f\"Next2 {next2['name']} AVG {next2['avg']}\"\n",
-    "        )\n",
-    "\n",
-    "        print(line1)\n",
-    "        print(line2)\n",
-    "        print(line3)\n",
-    "        print(line4)\n",
-    "        print(\"-\" * 140)\n",
-    "\n",
-    "    def render_header(self):\n",
-    "        now_str = datetime.now().strftime(\"%Y-%m-%d %H:%M:%S\")\n",
-    "        print(f\"=== MLB Live Monitor | {now_str} ===\")\n",
-    "        print(\"只顯示正在進行中的比賽 | 第八局推播：ON\" if self.push_enabled else \"只顯示正在進行中的比賽 | 第八局推播：OFF\")\n",
-    "        print(\"=\" * 140)\n",
-    "\n",
-    "    def run(self):\n",
-    "        self.running = True\n",
-    "        while self.running:\n",
-    "            try:\n",
-    "                clear_output(wait=True)\n",
-    "                self.render_header()\n",
-    "\n",
-    "                games = self.get_today_games()\n",
-    "                games_to_show = [g for g in games if g[\"status\"] in ACTIVE_STATUSES]\n",
-    "\n",
-    "                if not games_to_show:\n",
-    "                    print(\"目前沒有正在進行中的 MLB 比賽\")\n",
-    "                    for _ in range(self.refresh_seconds):\n",
-    "                        if not self.running:\n",
-    "                            break\n",
-    "                        time.sleep(1)\n",
-    "                    continue\n",
-    "\n",
-    "                for g in games_to_show:\n",
-    "                    if not self.running:\n",
-    "                        break\n",
-    "                    try:\n",
-    "                        s = self.get_live_snapshot(g[\"gamePk\"])\n",
-    "                        self.check_eighth_inning_alert(s)\n",
-    "                        self.print_snapshot_four_lines(s)\n",
-    "                    except Exception as e:\n",
-    "                        print(f\"讀取單場失敗 {g['gamePk']} ({g['away']} @ {g['home']}): {e}\")\n",
-    "                        print(\"-\" * 140)\n",
-    "\n",
-    "                for _ in range(self.refresh_seconds):\n",
-    "                    if not self.running:\n",
-    "                        break\n",
-    "                    time.sleep(1)\n",
-    "\n",
-    "            except KeyboardInterrupt:\n",
-    "                self.running = False\n",
-    "                clear_output(wait=True)\n",
-    "                print(\"已停止\")\n",
-    "                break\n",
-    "            except Exception as e:\n",
-    "                clear_output(wait=True)\n",
-    "                print(f\"主程式錯誤: {e}\")\n",
-    "                time.sleep(2)\n",
-    "\n",
-    "    def stop(self):\n",
-    "        self.running = False\n",
-    "        try:\n",
-    "            self.session.close()\n",
-    "        except Exception:\n",
-    "            pass\n",
-    "        print(\"停止要求已送出\")\n",
-    "\n",
-    "\n",
-    "monitor = MLBLiveMonitor(\n",
-    "    refresh_seconds=10,\n",
-    "    push_enabled=True,\n",
-    "    push_url=\"https://ntfy.sh/notiMLB26\",\n",
-    ")\n",
-    "\n",
-    "monitor.run()"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "f99e493c-2cec-4d26-865f-421fc452331b",
-   "metadata": {},
-   "outputs": [],
-   "source": []
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python [conda env:base] *",
-   "language": "python",
-   "name": "conda-base-py"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.12.2"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
+import time
+import requests
+from datetime import datetime, timedelta
+import streamlit as st
+
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="MLB Live Monitor",
+    page_icon="⚾",
+    layout="wide",
+)
+
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;600&display=swap');
+
+:root {
+    --green:  #00d46a;
+    --red:    #ff4b4b;
+    --yellow: #ffd93d;
+    --bg:     #0d0d0d;
+    --card:   #161616;
+    --border: #2a2a2a;
+    --muted:  #555;
+    --text:   #e8e8e8;
 }
+
+html, body, [data-testid="stAppViewContainer"] {
+    background: var(--bg) !important;
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--text);
+}
+
+[data-testid="stHeader"] { background: transparent !important; }
+
+/* 隱藏 Streamlit 預設元素 */
+#MainMenu, footer, [data-testid="stToolbar"] { display: none !important; }
+
+/* 主標題 */
+.mlb-title {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 3rem;
+    letter-spacing: 0.12em;
+    color: var(--green);
+    margin: 0;
+    line-height: 1;
+}
+.mlb-subtitle {
+    font-size: 0.72rem;
+    color: var(--muted);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-top: 2px;
+}
+
+/* 比賽卡片 */
+.game-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 18px;
+    position: relative;
+    overflow: hidden;
+}
+.game-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--green), transparent);
+}
+
+/* 隊伍比分 */
+.scoreline {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 2rem;
+    letter-spacing: 0.08em;
+    color: #fff;
+    margin-bottom: 10px;
+}
+.score-num {
+    color: var(--green);
+    font-size: 2.4rem;
+}
+
+/* 局數標籤 */
+.inning-badge {
+    display: inline-block;
+    background: #1e2e1e;
+    color: var(--green);
+    border: 1px solid var(--green);
+    border-radius: 4px;
+    padding: 2px 10px;
+    font-size: 0.75rem;
+    letter-spacing: 0.15em;
+    font-weight: 600;
+    margin-bottom: 12px;
+}
+
+/* 資訊列 */
+.info-row {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+    font-size: 0.78rem;
+    color: #aaa;
+}
+.info-item { display: flex; flex-direction: column; gap: 2px; }
+.info-label { color: var(--muted); font-size: 0.65rem; letter-spacing: 0.15em; text-transform: uppercase; }
+.info-value { color: var(--text); font-weight: 600; font-size: 0.82rem; }
+.info-value.highlight { color: var(--yellow); }
+
+/* 壘包圖示 */
+.bases-display {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 1rem;
+}
+
+/* 球員區 */
+.player-section {
+    border-top: 1px solid var(--border);
+    margin-top: 12px;
+    padding-top: 12px;
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    font-size: 0.78rem;
+}
+.player-block { display: flex; flex-direction: column; gap: 3px; }
+.player-role { color: var(--muted); font-size: 0.62rem; letter-spacing: 0.18em; text-transform: uppercase; }
+.player-name { color: #fff; font-weight: 600; }
+.player-stat { color: var(--green); font-size: 0.72rem; }
+
+/* 沒有比賽 */
+.no-game {
+    text-align: center;
+    padding: 60px 0;
+    color: var(--muted);
+    font-size: 1rem;
+    letter-spacing: 0.1em;
+}
+
+/* 時間戳 */
+.timestamp {
+    font-size: 0.65rem;
+    color: var(--muted);
+    letter-spacing: 0.12em;
+    margin-top: 4px;
+}
+
+/* 出局數點點 */
+.out-dots { display: inline-flex; gap: 5px; }
+.out-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    border: 1.5px solid var(--muted);
+    display: inline-block;
+}
+.out-dot.active { background: var(--yellow); border-color: var(--yellow); }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
+LIVE_URL     = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
+LIVE_DETAILED_STATES = {"In Progress", "Manager Challenge", "Review", "Warmup"}
+REFRESH_SECONDS = 15
+
+# ── Helper functions ───────────────────────────────────────────────────────────
+def safe_get(d, *keys, default=""):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+        if cur is None:
+            return default
+    return cur
+
+def get_player_stat_avg(player_obj):
+    for path in [
+        ("seasonStats", "batting", "avg"),
+        ("stats", "batting", "avg"),
+        ("stats", "batting", "summary"),
+    ]:
+        v = safe_get(player_obj, *path)
+        if v != "":
+            return v
+    return "-"
+
+def get_player_stat_era(player_obj):
+    for path in [
+        ("seasonStats", "pitching", "era"),
+        ("stats", "pitching", "era"),
+        ("stats", "pitching", "summary"),
+    ]:
+        v = safe_get(player_obj, *path)
+        if v != "":
+            return v
+    return "-"
+
+def get_pitch_count(player_obj):
+    for path in [
+        ("stats", "pitching", "numberOfPitches"),
+        ("stats", "pitching", "pitchesThrown"),
+        ("seasonStats", "pitching", "numberOfPitches"),
+    ]:
+        v = safe_get(player_obj, *path)
+        if v != "":
+            return v
+    return "-"
+
+def format_bases(on_1b, on_2b, on_3b):
+    def dot(filled):
+        return "🟡" if filled else "⚪"
+    return f"{dot(on_3b)} {dot(on_2b)} {dot(on_1b)}"
+
+def out_dots_html(outs):
+    dots = ""
+    for i in range(3):
+        cls = "out-dot active" if i < int(outs) else "out-dot"
+        dots += f'<span class="{cls}"></span>'
+    return f'<span class="out-dots">{dots}</span>'
+
+def is_live(game):
+    if game.get("abstract_state") == "Live":
+        return True
+    if game.get("status") in LIVE_DETAILED_STATES:
+        return True
+    return False
+
+# ── API calls ──────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def fetch_live_games():
+    today = datetime.now().date()
+    params = {
+        "sportId": 1,
+        "startDate": (today - timedelta(days=1)).strftime("%Y-%m-%d"),
+        "endDate":   (today + timedelta(days=1)).strftime("%Y-%m-%d"),
+    }
+    r = requests.get(SCHEDULE_URL, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    games, seen = [], set()
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            pk = g["gamePk"]
+            if pk in seen:
+                continue
+            seen.add(pk)
+            games.append({
+                "gamePk":         pk,
+                "abstract_state": safe_get(g, "status", "abstractGameState"),
+                "status":         safe_get(g, "status", "detailedState"),
+            })
+
+    results = []
+    for g in games:
+        if not is_live(g):
+            continue
+        try:
+            snap = fetch_snapshot(g["gamePk"])
+            if snap:
+                results.append(snap)
+        except Exception:
+            continue
+    return results
+
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def fetch_snapshot(gamePk):
+    url = LIVE_URL.format(gamePk=gamePk)
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    gd   = data.get("gameData", {})
+    ld   = data.get("liveData", {})
+    ls   = ld.get("linescore", {})
+    plays = ld.get("plays", {})
+    bs   = ld.get("boxscore", {})
+
+    offense = ls.get("offense", {})
+    on_1b = "first"  in offense
+    on_2b = "second" in offense
+    on_3b = "third"  in offense
+
+    cp = plays.get("currentPlay", {})
+    batter_id  = safe_get(cp, "matchup", "batter",  "id", default=None)
+    pitcher_id = safe_get(cp, "matchup", "pitcher", "id", default=None)
+
+    all_players = {}
+    all_players.update(safe_get(bs, "teams", "away", "players", default={}) or {})
+    all_players.update(safe_get(bs, "teams", "home", "players", default={}) or {})
+
+    batter_avg = pitcher_era = pitcher_pitch_count = "-"
+    if batter_id:
+        batter_avg = get_player_stat_avg(all_players.get(f"ID{batter_id}", {}))
+    if pitcher_id:
+        obj = all_players.get(f"ID{pitcher_id}", {})
+        pitcher_era         = get_player_stat_era(obj)
+        pitcher_pitch_count = get_pitch_count(obj)
+
+    inning_state = ls.get("inningState", "")
+    offense_key  = "away" if inning_state == "Top" else ("home" if inning_state == "Bottom" else "")
+    next_batters = []
+    if offense_key:
+        ot = safe_get(bs, "teams", offense_key, default={}) or {}
+        order = ot.get("battingOrder", []) or []
+        tplayers = ot.get("players", {}) or {}
+        cur_idx = None
+        if batter_id:
+            for idx, pid in enumerate(order):
+                if str(pid) == str(batter_id):
+                    cur_idx = idx
+                    break
+        if cur_idx is not None:
+            for step in [1, 2]:
+                ni = (cur_idx + step) % len(order)
+                np_obj = tplayers.get(f"ID{order[ni]}", {})
+                nm = safe_get(np_obj, "person", "fullName")
+                if nm:
+                    next_batters.append({"name": nm, "avg": get_player_stat_avg(np_obj)})
+
+    return {
+        "gamePk":       gamePk,
+        "away":         safe_get(gd, "teams", "away", "name", default="Away"),
+        "home":         safe_get(gd, "teams", "home", "name", default="Home"),
+        "away_score":   safe_get(ls, "teams", "away", "runs", default=0),
+        "home_score":   safe_get(ls, "teams", "home", "runs", default=0),
+        "status":       safe_get(gd, "status", "detailedState"),
+        "abstract_state": safe_get(gd, "status", "abstractGameState"),
+        "inning":       ls.get("currentInning", "-"),
+        "inning_state": inning_state,
+        "outs":         ls.get("outs", 0),
+        "balls":        safe_get(cp, "count", "balls",   default="?"),
+        "strikes":      safe_get(cp, "count", "strikes", default="?"),
+        "on_1b": on_1b, "on_2b": on_2b, "on_3b": on_3b,
+        "batter_name":         safe_get(cp, "matchup", "batter",  "fullName"),
+        "batter_avg":          batter_avg,
+        "pitcher_name":        safe_get(cp, "matchup", "pitcher", "fullName"),
+        "pitcher_era":         pitcher_era,
+        "pitcher_pitch_count": pitcher_pitch_count,
+        "next_batters":        next_batters,
+    }
+
+# ── Render one game card ───────────────────────────────────────────────────────
+def render_game_card(s):
+    inning_label = f"{s['inning_state'].upper()} {s['inning']}" if s['inning_state'] else str(s['inning'])
+    bases_str    = format_bases(s["on_1b"], s["on_2b"], s["on_3b"])
+    outs_html    = out_dots_html(s["outs"])
+
+    n1 = s["next_batters"][0] if len(s["next_batters"]) > 0 else {"name": "—", "avg": "—"}
+    n2 = s["next_batters"][1] if len(s["next_batters"]) > 1 else {"name": "—", "avg": "—"}
+
+    st.markdown(f"""
+    <div class="game-card">
+        <div class="scoreline">
+            {s['away']} <span class="score-num">{s['away_score']}</span>
+            &nbsp;:&nbsp;
+            <span class="score-num">{s['home_score']}</span> {s['home']}
+        </div>
+
+        <div class="inning-badge">▶ {inning_label}</div>
+
+        <div class="info-row">
+            <div class="info-item">
+                <span class="info-label">Count</span>
+                <span class="info-value highlight">{s['balls']}B {s['strikes']}S</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Outs</span>
+                <span class="info-value">{outs_html}</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Bases</span>
+                <span class="info-value">{bases_str}</span>
+            </div>
+        </div>
+
+        <div class="player-section">
+            <div class="player-block">
+                <span class="player-role">⚡ Pitcher</span>
+                <span class="player-name">{s['pitcher_name'] or '—'}</span>
+                <span class="player-stat">ERA {s['pitcher_era']} &nbsp;|&nbsp; {s['pitcher_pitch_count']} pitches</span>
+            </div>
+            <div class="player-block">
+                <span class="player-role">🏏 Batter</span>
+                <span class="player-name">{s['batter_name'] or '—'}</span>
+                <span class="player-stat">AVG {s['batter_avg']}</span>
+            </div>
+            <div class="player-block">
+                <span class="player-role">🔜 On Deck</span>
+                <span class="player-name">{n1['name']}</span>
+                <span class="player-stat">AVG {n1['avg']}</span>
+            </div>
+            <div class="player-block">
+                <span class="player-role">⏭ In the Hole</span>
+                <span class="player-name">{n2['name']}</span>
+                <span class="player-stat">AVG {n2['avg']}</span>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ── Main layout ────────────────────────────────────────────────────────────────
+st.markdown('<p class="mlb-title">⚾ MLB LIVE MONITOR</p>', unsafe_allow_html=True)
+st.markdown(f'<p class="mlb-subtitle">Auto-refresh every {REFRESH_SECONDS}s &nbsp;|&nbsp; Live games only</p>', unsafe_allow_html=True)
+
+now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+st.markdown(f'<p class="timestamp">Last updated: {now_str}</p>', unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ── Fetch & render ─────────────────────────────────────────────────────────────
+with st.spinner("抓取比賽資料中..."):
+    try:
+        live_games = fetch_live_games()
+    except Exception as e:
+        st.error(f"API 錯誤：{e}")
+        live_games = []
+
+if not live_games:
+    st.markdown('<div class="no-game">⚾ &nbsp; 目前沒有進行中的 MLB 比賽</div>', unsafe_allow_html=True)
+else:
+    for s in live_games:
+        render_game_card(s)
+
+# ── Auto-refresh ───────────────────────────────────────────────────────────────
+time.sleep(REFRESH_SECONDS)
+st.rerun()
